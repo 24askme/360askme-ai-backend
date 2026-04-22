@@ -1,4 +1,4 @@
-// server.js – Focused on Accommodation (Hotels, Apartments, Guesthouses)
+// server.js – Corrected Accommodation Flow with Area Preservation
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
@@ -16,8 +16,38 @@ const pool = new Pool({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Session store
 const sessions = new Map();
+
+// Extract information from user message
+function extractInfo(message) {
+  const msg = message.toLowerCase();
+  const info = { area: null, type: null, budget: null, bedrooms: null };
+  
+  // Areas (Kigali + secondary cities)
+  const areas = ['kacyiru', 'kiyovu', 'remera', 'nyarutarama', 'kimihurura', 'muhanga', 'rubavu', 'huye', 'musanze', 'rwamagana', 'kayonza', 'nyagatare', 'gicumbi', 'bugesera'];
+  for (const area of areas) {
+    if (msg.includes(area)) {
+      info.area = area.charAt(0).toUpperCase() + area.slice(1);
+      break;
+    }
+  }
+  
+  // Types
+  if (msg.includes('hotel')) info.type = 'hotel';
+  else if (msg.includes('guesthouse')) info.type = 'guesthouse';
+  else if (msg.includes('apartment')) info.type = 'apartment';
+  else if (msg.includes('house')) info.type = 'house';
+  
+  // Budget (numbers)
+  const budgetMatch = msg.match(/\$?(\d+)/);
+  if (budgetMatch) info.budget = parseInt(budgetMatch[1]);
+  
+  // Bedrooms
+  const bedroomMatch = msg.match(/(\d+)\s*bedroom/);
+  if (bedroomMatch) info.bedrooms = parseInt(bedroomMatch[1]);
+  
+  return info;
+}
 
 // Search accommodations
 async function searchAccommodations(filters) {
@@ -36,6 +66,10 @@ async function searchAccommodations(filters) {
     params.push(filters.type);
     sql += ` AND type = $${params.length}`;
   }
+  if (filters.bedrooms) {
+    params.push(filters.bedrooms);
+    sql += ` AND bedrooms = $${params.length}`;
+  }
   sql += ` LIMIT 5`;
   
   const result = await pool.query(sql, params);
@@ -49,85 +83,66 @@ app.post('/ask', async (req, res) => {
     if (!question) return res.status(400).json({ error: 'Question is required' });
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
-    // Get or create session
     let state = sessions.get(sessionId);
+    const extracted = extractInfo(question);
+    
+    // Initialize session if new
     if (!state) {
-      state = { step: 'start', filters: {} };
+      state = { 
+        step: 'start', 
+        filters: {}, 
+        awaiting: null,
+        lastResults: null
+      };
       sessions.set(sessionId, state);
     }
-
-    const q = question.toLowerCase();
     
-    // Check if this is an accommodation request
-    const isAccommodation = q.includes('house') || q.includes('apartment') || q.includes('hotel') || 
-                            q.includes('guesthouse') || q.includes('place to stay') || q.includes('accommodation') ||
-                            q.includes('room') || q.includes('lodge') || q.includes('villa');
+    // Merge extracted info into filters
+    if (extracted.area && !state.filters.area) state.filters.area = extracted.area;
+    if (extracted.type && !state.filters.type) state.filters.type = extracted.type;
+    if (extracted.budget && !state.filters.price_max) state.filters.price_max = extracted.budget;
+    if (extracted.bedrooms && !state.filters.bedrooms) state.filters.bedrooms = extracted.bedrooms;
     
-    // Handle accommodation flow
+    // Check if user is confirming handoff
+    const yesResponse = question.toLowerCase().trim() === 'yes' || 
+                        question.toLowerCase().trim() === 'yeah' || 
+                        question.toLowerCase().trim() === 'sure' ||
+                        question.toLowerCase().trim() === 'ok' ||
+                        question.toLowerCase().trim() === 'okay';
+    
+    if (state.step === 'waiting_for_confirmation' && yesResponse) {
+      sessions.delete(sessionId);
+      return res.json({ 
+        answer: "Excellent! I'm connecting you to a human concierge right now. They will contact you via WhatsApp within a few minutes to complete your booking. Thank you for choosing 360ASKME.",
+        handoff_data: { type: 'accommodation', action: 'handoff', options: state.lastResults }
+      });
+    }
+    
+    // Check if user wants accommodation
+    const isAccommodation = question.toLowerCase().includes('house') || 
+                            question.toLowerCase().includes('apartment') || 
+                            question.toLowerCase().includes('hotel') || 
+                            question.toLowerCase().includes('guesthouse') || 
+                            question.toLowerCase().includes('place to stay') ||
+                            question.toLowerCase().includes('accommodation') ||
+                            question.toLowerCase().includes('room') ||
+                            question.toLowerCase().includes('lodge');
+    
     if (isAccommodation || state.step !== 'start') {
       
-      // Step 1: Start - extract type and area
-      if (state.step === 'start') {
-        // Detect accommodation type
-        if (q.includes('hotel')) state.filters.type = 'hotel';
-        else if (q.includes('guesthouse')) state.filters.type = 'guesthouse';
-        else if (q.includes('apartment')) state.filters.type = 'apartment';
-        else if (q.includes('house')) state.filters.type = 'house';
-        
-        // Try to extract area
-        const areas = ['kacyiru', 'kiyovu', 'remera', 'nyarutarama', 'kimihurura', 'muhanga', 'rubavu', 'huye', 'musanze'];
-        for (const area of areas) {
-          if (q.includes(area)) {
-            state.filters.area = area.charAt(0).toUpperCase() + area.slice(1);
-            break;
-          }
-        }
-        
-        state.step = 'budget';
-        sessions.set(sessionId, state);
-        
-        let typeMsg = state.filters.type ? state.filters.type + ' ' : '';
-        let areaMsg = state.filters.area ? ` in ${state.filters.area}` : '';
-        return res.json({ answer: `What is your budget in USD for this ${typeMsg}accommodation${areaMsg}?`, handoff_data: null });
-      }
+      // Determine what information we still need
+      const missing = [];
+      if (!state.filters.price_max) missing.push('budget');
+      if (!state.filters.area) missing.push('area');
+      if (!state.filters.bedrooms && state.filters.type !== 'hotel') missing.push('bedrooms');
       
-      // Step 2: Get budget
-      if (state.step === 'budget') {
-        const match = question.match(/\d+/);
-        if (match) {
-          state.filters.price_max = parseInt(match[0]);
-          state.step = 'area';
-          sessions.set(sessionId, state);
-          return res.json({ answer: `Which area do you prefer? (e.g., Kacyiru, Kiyovu, Remera, Muhanga, Rubavu)`, handoff_data: null });
-        }
-        return res.json({ answer: `Please provide a numeric budget (e.g., 50 for $50 per night)`, handoff_data: null });
-      }
-      
-      // Step 3: Get area
-      if (state.step === 'area') {
-        const areas = ['kacyiru', 'kiyovu', 'remera', 'nyarutarama', 'kimihurura', 'muhanga', 'rubavu', 'huye', 'musanze', 'kigali'];
-        let foundArea = null;
-        for (const area of areas) {
-          if (question.toLowerCase().includes(area)) {
-            foundArea = area.charAt(0).toUpperCase() + area.slice(1);
-            break;
-          }
-        }
-        if (foundArea) {
-          state.filters.area = foundArea;
-        } else if (question.trim().length > 0) {
-          state.filters.area = question.trim();
-        }
-        
-        state.step = 'search';
-        sessions.set(sessionId, state);
-        
-        // Search immediately
+      // If we have all info, search immediately
+      if (missing.length === 0) {
         const results = await searchAccommodations(state.filters);
         sessions.delete(sessionId);
         
         if (results.length === 0) {
-          return res.json({ answer: `I couldn't find any accommodation matching your criteria (budget up to $${state.filters.price_max}, area: ${state.filters.area || 'any'}). Would you like to adjust your search or speak to a human concierge?`, handoff_data: { type: 'accommodation', filters: state.filters } });
+          return res.json({ answer: `I couldn't find any ${state.filters.type || 'accommodation'} matching your criteria (budget: $${state.filters.price_max}, area: ${state.filters.area}). Would you like to adjust your search or speak to a human concierge?`, handoff_data: null });
         }
         
         let answerText = `I found ${results.length} option(s) for you:\n\n`;
@@ -136,8 +151,33 @@ app.post('/ask', async (req, res) => {
           if (r.amenities) answerText += `   Amenities: ${r.amenities.join(', ')}\n`;
           answerText += `\n`;
         });
-        answerText += `Would you like me to connect you to a human concierge to book this for you?`;
-        return res.json({ answer: answerText, handoff_data: { type: 'accommodation', options: results } });
+        answerText += `Would you like me to connect you to a human concierge to book this for you? Please reply "yes" or "no".`;
+        
+        const newState = { step: 'waiting_for_confirmation', filters: state.filters, lastResults: results };
+        sessions.set(sessionId, newState);
+        
+        return res.json({ answer: answerText, handoff_data: null });
+      }
+      
+      // Ask for the next missing piece
+      if (missing.includes('budget')) {
+        state.step = 'asking_budget';
+        sessions.set(sessionId, state);
+        let typeMsg = state.filters.type ? state.filters.type + ' ' : '';
+        let areaMsg = state.filters.area ? ` in ${state.filters.area}` : '';
+        return res.json({ answer: `What is your budget in USD for this ${typeMsg}accommodation${areaMsg}?`, handoff_data: null });
+      }
+      
+      if (missing.includes('area')) {
+        state.step = 'asking_area';
+        sessions.set(sessionId, state);
+        return res.json({ answer: `Which area do you prefer? (e.g., Kacyiru, Kiyovu, Remera, Muhanga, Rubavu, Huye, Musanze)`, handoff_data: null });
+      }
+      
+      if (missing.includes('bedrooms')) {
+        state.step = 'asking_bedrooms';
+        sessions.set(sessionId, state);
+        return res.json({ answer: `How many bedrooms do you need?`, handoff_data: null });
       }
     }
     
